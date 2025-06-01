@@ -18,14 +18,13 @@ import {
 import { nanoid } from "nanoid";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyAg64B2TwlBUtOqVgL4feN_HhYwADBv03Y",
+  apiKey: import.meta.env.VITE_API_KEY,
   authDomain: "localhost:5173",
-  // authDomain: "video-chat-d759e.firebaseapp.com",
-  projectId: "video-chat-d759e",
-  storageBucket: "video-chat-d759e.firebasestorage.app",
-  messagingSenderId: "1043535205170",
-  appId: "1:1043535205170:web:bc43786c5574c011d97d2b",
-  measurementId: "G-SFQ0JBWLSQ",
+  projectId: import.meta.env.VITE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_APP_ID,
+  measurementId: import.meta.env.VITE_MEASUREMENT_ID,
 };
 
 const app = initializeApp(firebaseConfig);
