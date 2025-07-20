@@ -4,6 +4,7 @@ import { onAuthStateChanged, User } from "firebase/auth";
 
 export function useAuth() {
   const [user, setUser] = useState<User | null>(null); // Current user
+  const [token , setToken] = useState('')
   const [loading, setLoading] = useState(true); // Loading state
   const [error, setError] = useState(null); // Error state
 console.log(loading)
@@ -11,8 +12,9 @@ console.log(loading)
     // Set up the auth state listener
     const unsubscribe =  onAuthStateChanged(
       auth,
-      (currentUser:any) => {
+      async (currentUser:any) => {
         setUser(currentUser); // Update user state
+        setToken(await auth.currentUser?.getIdToken(true)??'')
         setLoading(false); // Authentication state resolved
       },
       (err:any) => {
@@ -25,5 +27,5 @@ console.log(loading)
     return () => unsubscribe();
   }, []);
 
-  return { user, loading, error };
+  return { user, loading, error, token };
 }

@@ -11,7 +11,8 @@ interface MeetingState {
     passcode: any,
     recipients?: string[],
     description?: string,
-    title?: string
+    title?: string,
+    rules?: any
   ) => Promise<any>;
   join: (
     meetingId: string,
@@ -33,13 +34,14 @@ const useMeetingStore = create<MeetingState>((set) => ({
         : participants,
   })),
 
-  create: async (isPrivate, passcode, recipients, description, title) => {
+  create: async (isPrivate, passcode, recipients, description, title, rules) => {
     const meetingData: any = await createMeeting(
       isPrivate,
       passcode,
       recipients,
       description,
-      title
+      title,
+      rules
     );
     const participants = meetingData.participants;
     console.log({participants})
@@ -53,7 +55,7 @@ const useMeetingStore = create<MeetingState>((set) => ({
     if (!tempUser && participants[0]) {
       setTempUser(participants[0]);
     }
-
+    document.cookie = `passcode=${passcode}; path=/; SameSite=Lax; Secure`
     return { meetingId: meetingData.meetingId, participants };
   },
 

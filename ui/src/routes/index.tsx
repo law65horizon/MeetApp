@@ -84,6 +84,79 @@ const Routes = () => {
     checkAuth();
   }, [checkAuth]);
 
+  // const router = createBrowserRouter([
+  //   {
+  //     path: '/',
+  //     element: <AppLayout />,
+  //     children: [
+  //       {
+  //         path: '/',
+  //         element: (
+  //           <ProtectedRoute>
+  //             <HomePage />
+  //           </ProtectedRoute>
+  //         ),
+  //       },
+  //       {
+  //         path: '/meetings',
+  //         element: (
+  //           <ProtectedRoute>
+  //             <MeetingsPage />
+  //           </ProtectedRoute>
+  //         ),
+  //       },
+  //       {
+  //         path: '/start-meeting',
+  //         element: (
+  //           <ProtectedRoute>
+  //             <StartMeetingPage />
+  //           </ProtectedRoute>
+  //         ),
+  //       },
+  //       {
+  //         path: '/meeting/:roomId',
+  //         element: <MeetingRoom />, // Accessible to all users
+  //       },
+  //       {
+  //         path: '/meetingxx/:id',
+  //         element: <NewMeetingRoom />, // Accessible to all users
+  //       },
+  //       {
+  //         path: '/settings',
+  //         element: (
+  //           <ProtectedRoute>
+  //             <SettingsPage />
+  //           </ProtectedRoute>
+  //         ),
+  //       },
+  //       {
+  //         path: '/profile',
+  //         element: (
+  //           <ProtectedRoute>
+  //             <ProfilePage />
+  //           </ProtectedRoute>
+  //         ),
+  //       },
+  //       {
+  //         path: '/support',
+  //         element: (
+  //           <ProtectedRoute>
+  //             <SupportPage />
+  //           </ProtectedRoute>
+  //         ),
+  //       },
+  //       {
+  //         path: '/auth',
+  //         element: firebaseUser ? <Navigate to="/" /> : <AuthPage />, // Accessible to unauthenticated users
+  //       },
+  //       {
+  //         path: '*',
+  //         element: <Navigate to="/" replace />,
+  //       },
+  //     ],
+  //   },
+  // ]);
+
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />

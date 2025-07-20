@@ -37,7 +37,7 @@ const CreateMeetingDialog = ({
       const passcode = 111000
       // const passcode: number = Math.floor(100000 + Math.random() * 900000); // 6-digit number
       setIsLoading(true)
-      const meetingData = await create(isPrivate, passcode, participants, description, meetingTitle)
+      const meetingData = await create(isPrivate, passcode, participants, description, meetingTitle, {})
       setUser(meetingData.participants[0])
       navigate(`/meeting/${meetingData.meetingId}`);
     } catch (error) {

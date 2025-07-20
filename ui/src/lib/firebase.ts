@@ -68,7 +68,8 @@ export const createMeeting = async (
   passcode: number,
   recipients?: string[],
   description?: string,
-  title?: string
+  title?: string,
+  rules?: any
 ) => {
   if (!auth.currentUser) {
     throw new Error("User must be logged in to create a meeting");
@@ -81,7 +82,7 @@ export const createMeeting = async (
     id: meetingId,
     hostId: auth.currentUser.uid,
     hostEmail: auth.currentUser.email,
-    recipients,
+    recipients: recipients??[],
     title: title ?? `Meeting with ${auth.currentUser.email?.split("@")[0]}`,
     status: "pending",
     createdAt: serverTimestamp(),
@@ -96,6 +97,7 @@ export const createMeeting = async (
     isPrivate,
     passcode,
     description,
+    rules
   };
 
   await setDoc(meetingRef, meetingData);
@@ -118,15 +120,16 @@ export const joinMeeting = async (
 
   const meetingData = meetingDoc.data();
 
+  console.log({status: meetingData.status})
   if (meetingData.status === "closed") throw new Error("Meeting over");
 
-  if (!auth.currentUser && meetingData.isPrivate) {
+  if (meetingData.isPrivate && ![meetingData.hostId, ...meetingData.recipients].includes(auth.currentUser?.uid)) {
     throw new Error("You are not authorized to join this meeting");
   }
 
-  if (meetingData.passcode != meetingCode) {
-    throw new Error("Invalid Meeting Code");
-  }
+  // if (meetingData.passcode != meetingCode) {
+  //   throw new Error("Invalid Meeting Code");
+  // }
 
   // ── Determine stable user ID ──────────────────────────────────────────────
   // For logged-in users: Firebase Auth UID.

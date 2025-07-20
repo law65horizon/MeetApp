@@ -36,6 +36,8 @@ interface MeetingState {
   setVideoInput: (deviceId: string) => void;
   fetchDevices: () => Promise<void>;
   clearNotification: (id: string) => void;
+
+  clearMeeting: () => void;
 }
 
 interface MediaActions {
@@ -246,4 +248,38 @@ export const useNewMeetingStore = create<StoreState>((set, get) => ({
     set({ isChatOpen: open });
     if (open) set({ unreadMessageCount: 0 });
   },
+
+  clearMeeting: () => {
+    set({
+      currentMeeting: null,
+      participants: [],
+      messages: [],
+      
+      // UI stat
+      isParticipantsListOpen: false,
+      isSettingsOpen: false,
+      isScreenSharing: false,
+      selectedLayout: 'grid',
+
+      // Chat
+      chatMessages: [],
+      unreadMessageCount: 0,
+      isChatOpen: false,
+      onSendChatMessage: null,
+      
+      // Media state
+      devices: [],
+      selectedAudioInput: 'default',
+      selectedAudioOutput: 'default',
+      selectedVideoInput: 'default',
+      isAudioMuted: false,
+      isVideoEnabled: true,
+      
+      notifications: [],
+
+      onToggleAudio: null,
+      onToggleVideo: null,
+      onToggleScreenShare: null,
+    })
+  }
 }));

@@ -1,14 +1,19 @@
 /**
- * App.tsx — Meeting page
+ * MeetingRoom.tsx
  *
- * Critical fix: ALL socket.on() listeners are registered at the TOP of start(),
- * before any socket.emit() calls. This prevents the race where the server fires
- * "newProducer" in response to "getProducers" before the listener is attached.
+ * Double-connect root cause: `start` was in the useEffect dependency array.
+ * `start` is a useCallback that recreates when `tempUser` changes, so the
+ * effect fired twice — once on mount, once when tempUser resolved. For
+ * authenticated users the `await getIdToken()` added enough delay that the
+ * cleanup from the first run could reset `didInitRef` before the second run
+ * checked it. For guests there is no await, so both runs happened synchronously
+ * and both passed the guard.
  *
- * Flow:
- *  1. Register all listeners (newProducer, peerLeft, etc.)
- *  2. Create send transport → produce local tracks
- *  3. LAST: call getProducers (so any newProducer events it triggers hit the listener)
+ * Fix: store `start` in a ref (`startRef`) and keep it current on every render.
+ * The bootstrap effect depends only on [roomId, tempUser] — stable values that
+ * only change when the user actually navigates to a different room or signs in.
+ * The effect body calls `startRef.current()` so it always uses the latest
+ * closure without needing `start` as a dependency.
  */
 
 import React, {
@@ -35,11 +40,11 @@ import { ArrowLeft, Clock } from "lucide-react";
 import VideoGrid from "../../components/video/VideoGrid";
 import MeetingControls from "../../components/meeting/MeetingControls";
 import useMeetingStore from "../../store/meetingStore";
-// import { onMeetingUpdate } from "../../lib/firebase";
 import useAuthStore from "../../store/authStore";
 import { useAuth } from "../../hooks/useAuth";
 import { useNewMeetingStore } from "../../store/newMeetingStore";
 import { ChatMessage, Participant, User } from "../../types";
+import { auth } from "../../lib/firebase";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -70,19 +75,16 @@ interface NewProducerData {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 const App: React.FC = () => {
-  const { user, loading: authLoading } = useAuth();
+  const { user } = useAuth();
   const tempUser = useAuthStore((s) => s.tempUser);
   const pps = useMeetingStore((s) => s.participants);
   const title = useMeetingStore((s) => s.title);
   const setPPs = useMeetingStore((s) => s.setParticipants);
   const setCallbacks = useNewMeetingStore((s) => s.setCallbacks);
   const receiveMessage = useNewMeetingStore((s) => s.receiveMessage);
+  const clearMeetingSettings = useNewMeetingStore((s) => s.clearMeeting)
   const setSendChatCallback = useNewMeetingStore((s) => s.setSendChatCallback);
-  const unreadMessageCount = useNewMeetingStore((s) => s.unreadMessageCount);
-
-  const setTempUser = useAuthStore((s) => s.setTempUser)
-
-  console.log({pps})
+  const setTempUser = useAuthStore((s) => s.setTempUser);
 
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
@@ -98,12 +100,12 @@ const App: React.FC = () => {
   const videoProducerRef = useRef<mediasoupClient.types.Producer | null>(null);
   const consumerMapRef = useRef<Map<string, mediasoupClient.types.Consumer>>(new Map());
   const peerProducersRef = useRef<Map<string, Set<string>>>(new Map());
-  
+
+  // ── Guard: prevents double-connect regardless of sync/async timing ─────────
+  const didInitRef = useRef(false);
 
   // ── State ──────────────────────────────────────────────────────────────────
   const [streams, setStreams] = useState<{ [peerId: string]: MediaStream }>({});
-  console.log('videostreams', Object.values(streams))
-  // const [participants, setParticipants] = useState<Participant[]>([]);
   const [elapsedTime, setElapsedTime] = useState(0);
   const [loading] = useState(false);
   const [unreadMessages] = useState(0);
@@ -114,21 +116,21 @@ const App: React.FC = () => {
     return () => clearInterval(id);
   }, []);
 
+  // ── Resolve tempUser from auth or session ──────────────────────────────────
   useEffect(() => {
     if (!tempUser) {
-      const id = user?.uid || sessionStorage.getItem('guestUserId')
-      if (!id) {
-        console.log('check id failed', {user}) 
-        return
-      }
-      const getTempUser: User = {
+      const id = user?.uid || sessionStorage.getItem("guestUserId");
+      if (!id) return;
+      setTempUser({
         id,
-        name: user?.displayName || user?.email?.split('@')[0] || sessionStorage.getItem('guestFullname') || 'Guest'
-      }
-      console.log('check', {getTempUser})
-      setTempUser(getTempUser)
+        name:
+          user?.displayName ||
+          user?.email?.split("@")[0] ||
+          sessionStorage.getItem("guestFullname") ||
+          "Guest",
+      } as User);
     }
-  }, [user])
+  }, [user]);
 
   const formatElapsedTime = () => {
     const h = Math.floor(elapsedTime / 3600);
@@ -137,108 +139,101 @@ const App: React.FC = () => {
     return `${h > 0 ? `${h}:` : ""}${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   };
 
-  // ── Participants ───────────────────────────────────────────────────────────
-  // useEffect(() => setParticipants(pps), [pps]);
-
-  // useEffect(() => {
-  //   if (!roomId) return;
-  //   const unsub = onMeetingUpdate(roomId, (data) => {
-  //     if (data.participants_data) setPPs(data.participants_data);
-  //   });
-  //   return unsub;
-  // }, [roomId]);
+  const leaveMeeting = () => {
+    setPPs([])
+    clearMeetingSettings()
+    navigate('/dashboard')
+  }
 
   // ── upsertTrack ────────────────────────────────────────────────────────────
-  // Always creates a NEW MediaStream so React's reference check triggers re-render.
   const upsertTrack = useCallback((peerId: string, track: MediaStreamTrack) => {
     setStreams((prev) => {
       const old = prev[peerId];
       const kept = old ? old.getTracks().filter((t) => t.kind !== track.kind) : [];
-      console.log('videostreams', {old, kept})
-      const next = new MediaStream([...kept, track]);
-      console.log(
-        `%c[streams] upsert peerId=${peerId} kind=${track.kind} total=${next.getTracks().length}`,
-        "color:#6ee7b7; font-weight:bold"
-      );
-      return { ...prev, [peerId]: next };
+      return { ...prev, [peerId]: new MediaStream([...kept, track]) };
     });
   }, []);
 
   // ── Media controls ─────────────────────────────────────────────────────────
 
-  const handleToggleAudio = useCallback(async (muted: boolean) => {
-    const track = localStreamRef.current?.getAudioTracks()[0];
-    if (track) track.enabled = !muted;
-    const p = audioProducerRef.current;
-    if (!p) return;
-    if (muted) { p.pause(); socketRef.current?.emit("pauseProducer", { roomId, producerId: p.id }); }
-    else { p.resume(); socketRef.current?.emit("resumeProducer", { roomId, producerId: p.id }); }
-  }, [roomId]);
+  const handleToggleAudio = useCallback(
+    async (muted: boolean) => {
+      const track = localStreamRef.current?.getAudioTracks()[0];
+      if (track) track.enabled = !muted;
+      const p = audioProducerRef.current;
+      if (!p) return;
+      if (muted) {
+        p.pause();
+        socketRef.current?.emit("pauseProducer", { roomId, producerId: p.id });
+      } else {
+        p.resume();
+        socketRef.current?.emit("resumeProducer", { roomId, producerId: p.id });
+      }
+    },
+    [roomId]
+  );
 
-  const handleToggleVideo = useCallback(async (enabled: boolean) => {
-    const track = localStreamRef.current?.getVideoTracks()[0];
-    if (track) track.enabled = enabled;
-    const p = videoProducerRef.current;
-    if (!p) return;
-    if (!enabled) { 
-      p.pause(); 
-      socketRef.current?.emit("pauseProducer", { roomId, producerId: p.id }); 
-    } else {
-      p.resume(); 
-      socketRef.current?.emit("resumeProducer", { roomId, producerId: p.id }); 
-    }
-  }, [roomId]);
+  const handleToggleVideo = useCallback(
+    async (enabled: boolean) => {
+      const track = localStreamRef.current?.getVideoTracks()[0];
+      if (track) track.enabled = enabled;
+      const p = videoProducerRef.current;
+      if (!p) return;
+      if (!enabled) {
+        p.pause();
+        socketRef.current?.emit("pauseProducer", { roomId, producerId: p.id });
+      } else {
+        p.resume();
+        socketRef.current?.emit("resumeProducer", { roomId, producerId: p.id });
+      }
+    },
+    [roomId]
+  );
 
-  const handleToggleScreenShare = useCallback(async (sharing: boolean) => {
-  const p = videoProducerRef.current;
-  if (!p || !tempUser) return;
+  const handleToggleScreenShare = useCallback(
+    async (sharing: boolean) => {
+      const p = videoProducerRef.current;
+      if (!p || !tempUser) return;
 
-  const restoreCam = async () => {
-    const screenStream = screenStreamRef.current;
-    screenStreamRef.current = null;
-    screenStream?.getTracks().forEach((t) => t.stop());
-
-    // ✅ Always get a fresh camera stream — the old track may have ended
-    const freshStream = await navigator.mediaDevices.getUserMedia({ video: true });
-    const freshTrack = freshStream.getVideoTracks()[0];
-
-    // Replace the ended track in localStreamRef so future restores also work
-    if (localStreamRef.current) {
-      localStreamRef.current.getVideoTracks().forEach((t) => {
-        localStreamRef.current!.removeTrack(t);
-        t.stop();
-      });
-      localStreamRef.current.addTrack(freshTrack);
-    }
-
-    const producer = videoProducerRef.current;
-    if (producer) {
-      await producer.replaceTrack({ track: freshTrack });
-    }
-    upsertTrack(tempUser.id, freshTrack);
-  };
-
-  if (sharing) {
-    try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-      screenStreamRef.current = screenStream;
-      const screenTrack = screenStream.getVideoTracks()[0];
-
-      screenTrack.onended = async () => {
-        useNewMeetingStore.getState().setScreenSharing(false);
-        await restoreCam();
+      const restoreCam = async () => {
+        const screenStream = screenStreamRef.current;
+        screenStreamRef.current = null;
+        screenStream?.getTracks().forEach((t) => t.stop());
+        const freshStream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const freshTrack = freshStream.getVideoTracks()[0];
+        if (localStreamRef.current) {
+          localStreamRef.current.getVideoTracks().forEach((t) => {
+            localStreamRef.current!.removeTrack(t);
+            t.stop();
+          });
+          localStreamRef.current.addTrack(freshTrack);
+        }
+        const producer = videoProducerRef.current;
+        if (producer) await producer.replaceTrack({ track: freshTrack });
+        upsertTrack(tempUser.id, freshTrack);
       };
 
-      await p.replaceTrack({ track: screenTrack });
-      upsertTrack(tempUser.id, screenTrack);
-    } catch (err) {
-      console.error("Screen share error:", err);
-      useNewMeetingStore.getState().setScreenSharing(false);
-    }
-  } else {
-    await restoreCam();
-  }
-}, [tempUser, upsertTrack]);
+      if (sharing) {
+        try {
+          const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+          screenStreamRef.current = screenStream;
+          const screenTrack = screenStream.getVideoTracks()[0];
+          screenTrack.onended = async () => {
+            useNewMeetingStore.getState().setScreenSharing(false);
+            await restoreCam();
+          };
+          await p.replaceTrack({ track: screenTrack });
+          upsertTrack(tempUser.id, screenTrack);
+        } catch (err) {
+          console.error("Screen share error:", err);
+          useNewMeetingStore.getState().setScreenSharing(false);
+        }
+      } else {
+        await restoreCam();
+      }
+    },
+    [tempUser, upsertTrack]
+  );
 
   useEffect(() => {
     setCallbacks({
@@ -251,21 +246,19 @@ const App: React.FC = () => {
   // ── start() ────────────────────────────────────────────────────────────────
 
   const start = useCallback(async () => {
-    if (!socketRef.current || !deviceRef.current || !tempUser) {
-      console.warn("[start] prerequisites missing — tempUser:", tempUser);
-      return;
-    }
+    if (!socketRef.current || !deviceRef.current || !tempUser) return;
 
     const socket = socketRef.current;
     const device = deviceRef.current;
     const myPeerId = tempUser.id;
 
-    socket.removeListener("newProducer");
-    socket.removeListener("peerLeft");
-    socket.removeListener("consumerClosed");
-    socket.removeListener("producerClosed");
+    socket.removeEventListener("newProducer");
+    socket.removeEventListener("peerLeft");
+    socket.removeEventListener("peerJoined");
+    socket.removeEventListener("consumerClosed");
+    socket.removeEventListener("producerClosed");
+    socket.removeEventListener("chatMessage");
 
-    // Recv transport (closure-local)
     let recvTransport: mediasoupClient.types.Transport | null = null;
     let recvTransportId: string | null = null;
     let recvTransportCreating: Promise<void> | null = null;
@@ -273,47 +266,30 @@ const App: React.FC = () => {
     function ensureRecvTransport(): Promise<void> {
       if (recvTransport) return Promise.resolve();
       if (recvTransportCreating) return recvTransportCreating;
-
       recvTransportCreating = new Promise<void>((resolve, reject) => {
-        socket.emit(
-          "createWebRtcTransport",
-          { roomId, direction: "recv" },
-          (params: TransportData) => {
-            if (params.error) { console.error("[recv] create error:", params.error); return reject(new Error(params.error)); }
-            console.log("%c[recv transport] created id=" + params.id, "color:#a78bfa");
-            recvTransportId = params.id;
-
-            const t = device.createRecvTransport({
-              id: params.id,
-              iceParameters: params.iceParameters,
-              iceCandidates: params.iceCandidates,
-              dtlsParameters: params.dtlsParameters,
-              iceServers: params.iceServers ?? [],
-            });
-
-            t.on("connect", ({ dtlsParameters: dp }, cb, errback) => {
-              socket.emit("connectTransport", { roomId, transportId: params.id, dtlsParameters: dp },
-                (res: any) => res.error ? errback(new Error(res.error)) : cb());
-            });
-            t.on("connectionstatechange", (s) => console.log("[recv transport] state:", s));
-
-            recvTransport = t;
-            resolve();
-          }
-        );
+        socket.emit("createWebRtcTransport", { roomId, direction: "recv" }, (params: TransportData) => {
+          if (params.error) return reject(new Error(params.error));
+          recvTransportId = params.id;
+          const t = device.createRecvTransport({
+            id: params.id,
+            iceParameters: params.iceParameters,
+            iceCandidates: params.iceCandidates,
+            dtlsParameters: params.dtlsParameters,
+            iceServers: params.iceServers ?? [],
+          });
+          t.on("connect", ({ dtlsParameters: dp }, cb, errback) => {
+            socket.emit("connectTransport", { roomId, transportId: params.id, dtlsParameters: dp },
+              (res: any) => (res.error ? errback(new Error(res.error)) : cb()));
+          });
+          recvTransport = t;
+          resolve();
+        });
       });
       return recvTransportCreating;
     }
 
     async function consume(producerId: string, kind: string, peerId: string): Promise<void> {
-      // ensureRecvTransport must be awaited before this is called
-      if (!recvTransport || !recvTransportId) {
-        console.error("[consume] called before recvTransport was ready — this is a bug");
-        return;
-      }
-
-      console.log(`%c[consume] producerId=${producerId} kind=${kind} peerId=${peerId}`, "color:#f59e0b; font-weight:bold");
-
+      if (!recvTransport || !recvTransportId) return;
       return new Promise<void>((resolve) => {
         socket.emit("consume", {
           roomId,
@@ -321,86 +297,50 @@ const App: React.FC = () => {
           producerId,
           clientRtpCapabilities: device.rtpCapabilities,
         }, async (params: ConsumerData) => {
-          if (params.error) { console.error("[consume] server error:", params.error); return resolve(); }
-
+          if (params.error) return resolve();
           const consumer = await recvTransport!.consume({
             id: params.id,
             producerId: params.producerId,
             kind: params.kind,
             rtpParameters: params.rtpParameters,
           });
-
           consumerMapRef.current.set(producerId, consumer);
           if (!peerProducersRef.current.has(peerId)) peerProducersRef.current.set(peerId, new Set());
           peerProducersRef.current.get(peerId)!.add(producerId);
-
           socket.emit("consumerResume", { roomId, consumerId: consumer.id }, async (res: any) => {
-            if (res.error) { console.error("[consumerResume] error:", res.error); return resolve(); }
-
+            if (res.error) return resolve();
             await consumer.resume();
-            console.log(
-              `%c[consume] ✅ resumed kind=${consumer.track.kind} readyState=${consumer.track.readyState} peerId=${peerId}`,
-              "color:#6ee7b7; font-weight:bold"
-            );
-
             if (kind === "video") {
               setTimeout(() => socket.emit("requestKeyFrame", { roomId, consumerId: consumer.id }), 150);
             }
-
             upsertTrack(peerId, consumer.track);
-
-            consumer.track.onunmute = () => {
-              console.log(`[track] onunmute kind=${consumer.track.kind} peerId=${peerId}`);
-              upsertTrack(peerId, consumer.track);
-            };
-
+            consumer.track.onunmute = () => upsertTrack(peerId, consumer.track);
             resolve();
           });
         });
       });
     }
 
-    // ── STEP 1: Register ALL listeners BEFORE any emit ─────────────────────
-    // This is critical — getProducers will cause the server to immediately
-    // emit newProducer events, which must already have a listener attached.
-
+    // Register ALL listeners BEFORE any emits
     socket.on("newProducer", async ({ producerId, kind, appData: ad }: NewProducerData) => {
       const peerId: string = ad?.peerId ?? "unknown";
-      console.log(`%c[newProducer] producerId=${producerId} kind=${kind} peerId=${peerId}`, "color:#f59e0b; font-weight:bold");
-
-      if (peerId === myPeerId) {
-        console.log("[newProducer] skipping own producer");
-        return;
-      }
-
+      if (peerId === myPeerId) return;
       await ensureRecvTransport();
       await consume(producerId, kind, peerId);
     });
 
     socket.on("peerJoined", ({ peerId, peerUserName }: { peerId: string; peerUserName: string }) => {
-      console.log('pps peer joined')
-      if (peerId) {
-        // setPPs([...pps, {id: peerId, name: peerUserName ?? 'Guest'}])
-        setPPs((prev) => [...prev, { id: peerId, name: peerUserName ?? 'Guest' }])
-      }
-    })
+      if (peerId) setPPs((prev) => [...prev, { id: peerId, name: peerUserName ?? "Guest" }]);
+    });
 
     socket.on("peerLeft", ({ peerId, producerIds }: { peerId: string; producerIds: string[] }) => {
       if (peerId === myPeerId) return;
-      console.log(`[peerLeft] peerId=${peerId}`, producerIds);
       const tracked = peerProducersRef.current.get(peerId);
       const toClose = tracked ? [...tracked] : (producerIds ?? []);
       toClose.forEach((pid) => { consumerMapRef.current.get(pid)?.close(); consumerMapRef.current.delete(pid); });
       peerProducersRef.current.delete(peerId);
       setStreams((prev) => { const next = { ...prev }; delete next[peerId]; return next; });
-      console.log('peerLeft', {pps, peerId})
-      const pp = pps.filter(particpant => particpant.id !== peerId )
-      console.log('peerLeft', {pps, pp, peerId})
-      setPPs((prev:Participant[]) => prev.filter((p:Participant) => p.id !== peerId));
-      // setPPs(pps.filter(particpant => particpant.id !== peerId ))
-      // setPPs((prev) => prev.filter((p) => p.id !== peerId));
-      // useNewMeetingStore.getState().setScreenSharing(false)
-      // setPPs((prev) => prev.filter((p) => p.id !== peerId));
+      setPPs((prev: Participant[]) => prev.filter((p: Participant) => p.id !== peerId));
     });
 
     socket.on("consumerClosed", ({ producerId }: { producerId: string }) => {
@@ -413,25 +353,23 @@ const App: React.FC = () => {
       consumerMapRef.current.delete(producerId);
     });
 
-    socket.on("chatMessage", (msg: ChatMessage) => {
-      receiveMessage(msg);
-    });
+    socket.on("chatMessage", (msg: ChatMessage) => receiveMessage(msg));
 
     setSendChatCallback((text: string) => {
-      if (!text.trim() || !tempUser) return;
+      if (!text.trim()) return;
       const msg: ChatMessage = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         senderId: myPeerId,
         senderName: tempUser.name,
         content: text.trim(),
         timestamp: Date.now(),
-        isPrivate: false
-      }
-      receiveMessage(msg)
-      socket.emit("sendMessage", {roomId, message: msg})
-    })
+        isPrivate: false,
+      };
+      receiveMessage(msg);
+      socket.emit("sendMessage", { roomId, message: msg });
+    });
 
-    //  Capture local media ────────────────────────────────────────
+    // Local media
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 1280, height: 720, frameRate: 30 },
@@ -439,20 +377,16 @@ const App: React.FC = () => {
       });
       localStreamRef.current = stream;
       setStreams((prev) => ({ ...prev, [myPeerId]: stream }));
-      console.log("%c[start] local stream ready peerId=" + myPeerId, "color:#6ee7b7; font-weight:bold");
     } catch (err) {
       console.error("[start] getUserMedia error:", err);
     }
 
+    // Send transport + produce
     try {
-      // Create send transport + produce tracks ─────────────────────
       await new Promise<void>((resolveSendTransport) => {
         socket.emit("createWebRtcTransport", { roomId, direction: "send" }, async (params: TransportData) => {
-          if (params.error) { console.error("[send transport] error:", params.error); return resolveSendTransport(); }
-          console.log("%c[send transport] created id=" + params.id, "color:#a78bfa");
-  
+          if (params.error) return resolveSendTransport();
           const sendTransportId = params.id;
-  
           const t = device.createSendTransport({
             id: params.id,
             iceParameters: params.iceParameters,
@@ -460,37 +394,23 @@ const App: React.FC = () => {
             dtlsParameters: params.dtlsParameters,
             iceServers: params.iceServers ?? [],
           });
-  
           t.on("connect", ({ dtlsParameters: dp }, cb, errback) => {
             socket.emit("connectTransport", { roomId, transportId: sendTransportId, dtlsParameters: dp },
-              (res: any) => res.error ? errback(new Error(res.error)) : cb());
+              (res: any) => (res.error ? errback(new Error(res.error)) : cb()));
           });
-  
           t.on("produce", ({ kind, rtpParameters, appData: ad }, cb, errback) => {
-            console.log({myPeerId})
             socket.emit("produce", {
-              roomId,
-              transportId: sendTransportId,
-              kind,
-              rtpParameters,
+              roomId, transportId: sendTransportId, kind, rtpParameters,
               appData: { ...ad, peerId: myPeerId },
-            }, (res: any) => res.error ? errback(new Error(res.error)) : cb({ id: res.id }));
+            }, (res: any) => (res.error ? errback(new Error(res.error)) : cb({ id: res.id })));
           });
-  
-          t.on("connectionstatechange", (s) => console.log("[send transport] state:", s));
-  
-          // Produce local tracks
           if (localStreamRef.current) {
             const audioTrack = localStreamRef.current.getAudioTracks()[0];
             const videoTrack = localStreamRef.current.getVideoTracks()[0];
-  
             if (audioTrack) {
-              try {
-                audioProducerRef.current = await t.produce({ track: audioTrack });
-                console.log("[produce] audio id=", audioProducerRef.current.id);
-              } catch (e) { console.error("[produce] audio failed:", e); }
+              try { audioProducerRef.current = await t.produce({ track: audioTrack }); }
+              catch (e) { console.error("[produce] audio failed:", e); }
             }
-  
             if (videoTrack) {
               try {
                 videoProducerRef.current = await t.produce({
@@ -502,111 +422,108 @@ const App: React.FC = () => {
                   ],
                   codecOptions: { videoGoogleStartBitrate: 1000 },
                 });
-                console.log("[produce] video id=", videoProducerRef.current.id);
               } catch (e) { console.error("[produce] video failed:", e); }
             }
           }
-  
           resolveSendTransport();
         });
       });
-  
-      // LAST — fetch existing producers ────────────────────────────
-      // newProducer listener is already registered (step 1), so events won't be missed.
-      console.log("[getProducers] requesting...");
-      socket.emit(
-        "getProducers",
-        { roomId, clientRtpCapabilities: device.rtpCapabilities },
-        (res: any) => {
-          if (res?.error) console.error("[getProducers] error:", res.error);
-          else console.log("[getProducers] ✅ done");
-        }
-      );
-    } catch (error) {
-      console.error(error)
-       setTimeout(() => {
-    navigate('/', { replace: true });
-  }, 0);
-    }
 
+      socket.emit("getProducers", { roomId, clientRtpCapabilities: device.rtpCapabilities },
+        (res: any) => { if (res?.error) console.error("[getProducers] error:", res.error); });
+    } catch (error) {
+      console.error("[start] fatal error:", error);
+      setTimeout(() => leaveMeeting(), 0);
+    }
   }, [roomId, tempUser, upsertTrack]);
 
+  // Keep a stable ref to the latest `start` so the bootstrap effect can call
+  // it without listing it as a dependency (which would cause re-fires).
+  const startRef = useRef(start);
+  useEffect(() => {console.log("starting", startRef.current, socketRef.current); startRef.current = start; }, [start]);
+
   // ── Socket bootstrap ───────────────────────────────────────────────────────
+  // Dependencies: only [roomId, tempUser] — both are stable primitive/object
+  // identity values that change only when the user navigates or signs in.
+  // `start` is intentionally NOT a dependency; we call it via startRef instead.
   useEffect(() => {
-    if (!roomId || !tempUser) {
-      console.log('check start failed', user,)
-      return
-    }  else {
-      console.log('check start passed')
-    }// wait for user identity before connecting
-    console.log('check', {authLoading, user, tempUser, storage: sessionStorage.getItem('guestUserId'), storageName: sessionStorage.getItem('guestFullname')})
+    if (!roomId || !tempUser) return;
 
-    const socket = io("http://localhost:3000", {
-      reconnection: true,
-      reconnectionAttempts: 5,
-    });
-    socketRef.current = socket;
-    deviceRef.current = new mediasoupClient.Device();
+    // Synchronous guard — prevents any second invocation from proceeding,
+    // whether it arrives synchronously (guest, no await) or after an async
+    // gap (authenticated user awaiting getIdToken).
+    if (didInitRef.current) return;
+    didInitRef.current = true;
 
-    socket.on("connect", () => {
-      console.log("[socket] connected id=", socket.id, tempUser);
-      // Pass our app-level user ID so the server can inject it into all
-      // newProducer events — this is the single source of truth for peerId.
-      socket.emit("joinRoom", { roomId, rtpCapabilities: null, appUserId: tempUser?.id ?? socket.id, appUserName: tempUser.name },
-        async (res: { rtpCapabilities: any, peers: any }) => {
-          try {
-            setPPs(res.peers)
-            await deviceRef.current!.load({ routerRtpCapabilities: res.rtpCapabilities });
-            console.log("[device] loaded");
-            await start();
-          } catch (e) {
-            console.error("[device/start] error:", e);
-          }
-        }
-      );
-    },);
+    let cancelled = false;
 
-    socket.on("connect_error", (e: Error) => console.error("[socket] connect_error:", e.message));
+    (async () => {
+      try {
+        const token = auth.currentUser
+          ? await auth.currentUser.getIdToken(true).catch(() => "")
+          : "";
+  
+        // If cleanup ran while we were awaiting the token, bail out.
+        if (cancelled) return;
+  
+        console.log('starting socket')
+        const socket = io("http://localhost:3000", {
+          reconnection: true,
+          reconnectionAttempts: 5,
+          auth: { token },
+          withCredentials: true,
+        } as any);
+        socketRef.current = socket;
+        deviceRef.current = new mediasoupClient.Device();
+  
+        socket.on("connect", () => {
+          console.log("[socket] connected id=", socket.id);
+          socket.emit(
+            "joinRoom",
+            { roomId, rtpCapabilities: null, appUserId: tempUser.id, appUserName: tempUser.name },
+            async (res: { rtpCapabilities: any; peers: any, error: any }) => {
+              try {
+                setPPs(res.peers ?? []);
+                await deviceRef.current!.load({ routerRtpCapabilities: res.rtpCapabilities });
+                await startRef.current();
+              } catch (e:any) {
+                console.error("[device/start] error:", e, res.error);
+                alert(res.error)
+                navigate('/dashboard')
+              }
+            }
+          );
+        });
+  
+        socket.on("connect_error", (e: Error) =>
+          console.error("[socket] connect_error:", e.message)
+        );
+      } catch (error) {
+        console.error("connecterr", error)
+      }
+    })();
 
     return () => {
-      socket.disconnect();
+      cancelled = true;
+      didInitRef.current = false;
+      socketRef.current?.disconnect();
+      socketRef.current = null;
+      deviceRef.current = null;
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
     };
-  }, [roomId, start, tempUser]);
+  }, [roomId, tempUser]); // <-- `start` deliberately excluded; called via startRef
 
-  // ── Derived ────────────────────────────────────────────────────────────────
-  // const screenShareParticipant = useMemo(
-  //   () => participants.find((p) => p.isScreenSharing),
-  //   [participants]
-  // );
-
-//   const screenShareParticipant = useMemo(() => {
-//   return participants.find((p) => {
-//     const stream = streams[p.id];
-//     if (!stream) return false;
-
-//     const videoTrack = stream.getVideoTracks()[0];
-//     if (!videoTrack) return false;
-
-//     // Detect screen track
-//     return videoTrack.label.toLowerCase().includes("screen");
-//   });
-// }, [participants, streams]);
-const screenShareParticipant = useMemo(() => {
-  return pps.find((p) => {
-    const stream = streams[p.id];
-    if (!stream) return false;
-
-    const track = stream.getVideoTracks()[0];
-    if (!track) return false;
-
-    const settings = track.getSettings();
-    return !!settings.displaySurface;
-  });
-}, [pps, streams]);
-
-console.log({screenShareParticipant})
+  // ── Screen share detection ─────────────────────────────────────────────────
+  const screenShareParticipant = useMemo(() => {
+    return pps?.find((p) => {
+      const stream = streams[p.id];
+      if (!stream) return false;
+      const track = stream.getVideoTracks()[0];
+      if (!track) return false;
+      return !!track.getSettings().displaySurface;
+    });
+  }, [pps, streams]);
 
   // ── Render ─────────────────────────────────────────────────────────────────
   if (loading) {
@@ -621,19 +538,20 @@ console.log({screenShareParticipant})
   return (
     <Box sx={{ display: "flex", height: "100vh", width: "100%", overflow: "hidden", bgcolor: "#0a0a0f", flexDirection: "column" }}>
       <AppBar position="static" elevation={0}
-        sx={{ bgcolor: "rgba(15,15,25,0.95)", backdropFilter: "blur(12px)", borderBottom: "1px solid rgba(255,255,255,0.06)", flexShrink: 0 }}
-      >
+        sx={{ bgcolor: "rgba(15,15,25,0.95)", backdropFilter: "blur(12px)", borderBottom: "1px solid rgba(255,255,255,0.06)", flexShrink: 0 }}>
         <Toolbar sx={{ gap: 1 }}>
           <IconButton edge="start" onClick={() => navigate("/dashboard")}
             sx={{ color: "#94a3b8", "&:hover": { color: "#fff" } }}>
             <ArrowLeft size={20} />
           </IconButton>
-          <Typography variant="h6" sx={{ flexGrow: 1, fontFamily: "'Sora', sans-serif", fontWeight: 600, fontSize: "1rem", color: "#e2e8f0", letterSpacing: "-0.01em" }}>
+          <Typography variant="h6"
+            sx={{ flexGrow: 1, fontFamily: "'Sora', sans-serif", fontWeight: 600, fontSize: "1rem", color: "#e2e8f0", letterSpacing: "-0.01em" }}>
             {title || "Meeting"}
           </Typography>
           <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, bgcolor: "rgba(255,255,255,0.05)", borderRadius: 2, px: 1.5, py: 0.5 }}>
             <Clock size={14} color="#6ee7b7" />
-            <Typography variant="body2" sx={{ color: "#6ee7b7", fontFamily: "monospace", fontSize: "0.8rem", letterSpacing: "0.05em" }}>
+            <Typography variant="body2"
+              sx={{ color: "#6ee7b7", fontFamily: "monospace", fontSize: "0.8rem", letterSpacing: "0.05em" }}>
               {formatElapsedTime()}
             </Typography>
           </Box>
@@ -650,7 +568,7 @@ console.log({screenShareParticipant})
       </Box>
 
       <MeetingControls
-        onLeave={() => navigate("/dashboard")}
+        onLeave={() => leaveMeeting()}
         onToggleChat={() => {}}
         onToggleParticipants={() => {}}
         unreadMessages={unreadMessages}
