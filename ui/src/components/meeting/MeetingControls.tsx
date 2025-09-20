@@ -36,7 +36,7 @@ import {
 } from "lucide-react";
 import { useNewMeetingStore } from "../../store/newMeetingStore";
 import DeviceSettings from "./DeviceSettings";
-import ChatPanel from "../chat/ChatPanel2";
+import ChatPanel from "../chat/ChatPanel";
 import ParticipantsList from "./ParticipantsList";
 import useMeetingStore from "../../store/meetingStore";
 
@@ -91,7 +91,9 @@ const MeetingControls = ({
   const [collapsed, setCollapsed] = useState(false);
   const [confirmLeaveOpen, setConfirmLeaveOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [chatOpen, setChatOpen] = useState(false);
+  // const [chatOpen, setChatOpen] = useState(false);
+  const chatOpen = useNewMeetingStore((s) => s.isChatOpen)
+  const setChatOpen = useNewMeetingStore((s) => s.setChatOpen)
   const [participantsOpen, setParticipantsOpen] = useState(false);
 
   const participants = useMeetingStore((s) => s.participants);
@@ -212,7 +214,7 @@ const MeetingControls = ({
               <IconButton
                 onClick={() => {
                   closeAll();
-                  setChatOpen((v) => !v);
+                  setChatOpen(!chatOpen);
                 }}
                 sx={ctrlBtn(chatOpen)}
               >

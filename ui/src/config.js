@@ -1,4 +1,3 @@
 export const config = {
-    SERVER_ENDPOINT: 'localhost:3000',
-    APP_ENDPOINT: 'localhost:5001',
+  SERVER_URL: import.meta.env.VITE_SERVER_URL || 'http://localhost:3000',
 };

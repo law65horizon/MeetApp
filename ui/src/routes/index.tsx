@@ -11,33 +11,30 @@ import MeetingRoom from '../pages/meeting/MeetingRoom';
 import SettingsPage from '../pages/settings/SettingsPage';
 import ProfilePage from '../pages/profile/ProfilePage';
 import SupportPage from '../pages/support/SupportPage';
-import useAuthStore from '../store/authStore';
-import { useEffect } from 'react';
 import { useAuth } from '../hooks/useAuth';
-import NewMeetingRoom from '../pages/newMeeting/newMeeting';
+import { Box, CircularProgress } from '@mui/material';
 
-// ProtectedRoute component to restrict access to authenticated users
+const LoadingScreen = () => (
+  <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh' }}>
+    <CircularProgress />
+  </Box>
+);
+
 const ProtectedRoute = () => {
   const { user, loading } = useAuth();
   const location = useLocation();
 
-  if (loading) return <div>Loading...</div>;
-
-  if (!user) {
-    return <Navigate to="/auth" state={{ from: location }} replace />;
-  }
-
+  if (loading) return <LoadingScreen />;
+  if (!user) return <Navigate to="/auth" state={{ from: location }} replace />;
   return <Outlet />;
 };
 
 const PublicRoute = () => {
   const { user, loading } = useAuth();
-
-  if (loading) return <div>Loading...</div>;
-
+  if (loading) return <LoadingScreen />;
   return user ? <Navigate to="/" replace /> : <Outlet />;
 };
- 
+
 const router = createBrowserRouter([
   {
     path: '/',
@@ -56,17 +53,12 @@ const router = createBrowserRouter([
       },
       {
         element: <PublicRoute />,
-        children: [
-          { path: 'auth', element: <AuthPage /> },
-        ],
+        children: [{ path: 'auth', element: <AuthPage /> }],
       },
       {
+        // Meeting room is accessible to guests too (they join with a code)
         path: 'meeting/:roomId',
         element: <MeetingRoom />,
-      },
-      {
-        path: 'meetingxx/:id',
-        element: <NewMeetingRoom />,
       },
       {
         path: '*',
@@ -76,93 +68,11 @@ const router = createBrowserRouter([
   },
 ]);
 
-const Routes = () => {
-  const { checkAuth } = useAuthStore();
-  // const { user: firebaseUser } = useAuth();
-
-  useEffect(() => {
-    checkAuth();
-  }, [checkAuth]);
-
-  // const router = createBrowserRouter([
-  //   {
-  //     path: '/',
-  //     element: <AppLayout />,
-  //     children: [
-  //       {
-  //         path: '/',
-  //         element: (
-  //           <ProtectedRoute>
-  //             <HomePage />
-  //           </ProtectedRoute>
-  //         ),
-  //       },
-  //       {
-  //         path: '/meetings',
-  //         element: (
-  //           <ProtectedRoute>
-  //             <MeetingsPage />
-  //           </ProtectedRoute>
-  //         ),
-  //       },
-  //       {
-  //         path: '/start-meeting',
-  //         element: (
-  //           <ProtectedRoute>
-  //             <StartMeetingPage />
-  //           </ProtectedRoute>
-  //         ),
-  //       },
-  //       {
-  //         path: '/meeting/:roomId',
-  //         element: <MeetingRoom />, // Accessible to all users
-  //       },
-  //       {
-  //         path: '/meetingxx/:id',
-  //         element: <NewMeetingRoom />, // Accessible to all users
-  //       },
-  //       {
-  //         path: '/settings',
-  //         element: (
-  //           <ProtectedRoute>
-  //             <SettingsPage />
-  //           </ProtectedRoute>
-  //         ),
-  //       },
-  //       {
-  //         path: '/profile',
-  //         element: (
-  //           <ProtectedRoute>
-  //             <ProfilePage />
-  //           </ProtectedRoute>
-  //         ),
-  //       },
-  //       {
-  //         path: '/support',
-  //         element: (
-  //           <ProtectedRoute>
-  //             <SupportPage />
-  //           </ProtectedRoute>
-  //         ),
-  //       },
-  //       {
-  //         path: '/auth',
-  //         element: firebaseUser ? <Navigate to="/" /> : <AuthPage />, // Accessible to unauthenticated users
-  //       },
-  //       {
-  //         path: '*',
-  //         element: <Navigate to="/" replace />,
-  //       },
-  //     ],
-  //   },
-  // ]);
-
-  return (
-    <ThemeProvider theme={theme}>
-      <CssBaseline />
-      <RouterProvider router={router} />
-    </ThemeProvider>
-  );
-};
+const Routes = () => (
+  <ThemeProvider theme={theme}>
+    <CssBaseline />
+    <RouterProvider router={router} />
+  </ThemeProvider>
+);
 
 export default Routes;

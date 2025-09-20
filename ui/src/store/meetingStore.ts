@@ -16,7 +16,7 @@ interface MeetingState {
   ) => Promise<any>;
   join: (
     meetingId: string,
-    meetingCode: string,
+    passcode: string,
     fullname: string | undefined
   ) => Promise<any>;
   title: string | null;
@@ -59,12 +59,13 @@ const useMeetingStore = create<MeetingState>((set) => ({
     return { meetingId: meetingData.meetingId, participants };
   },
 
-  join: async (meetingId, meetingCode, fullname) => {
+  join: async (meetingId, passcode, fullname) => {
     const meetingData: any = await joinMeeting(
       meetingId.trim(),
-      meetingCode.trim(),
+      passcode.trim(),
       fullname
     );
+    console.log('joining meeting')
     // const participants = meetingData.participants_data;
     const title = meetingData.title;
     set({ title });
@@ -82,6 +83,8 @@ const useMeetingStore = create<MeetingState>((set) => ({
       );
     }
 
+    document.cookie = `passcode=${passcode}; path=/; SameSite=Lax; Secure`
+    console.log({passcode})
     return meetingData;
   },
 }));

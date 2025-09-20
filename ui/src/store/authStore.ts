@@ -1,74 +1,93 @@
 import { create } from 'zustand';
 import { User } from '../types';
-import { createUser, logout, signIn } from '../lib/firebase';
+import { createUser, logout as firebaseLogout, signIn } from '../lib/firebase';
+import { auth } from '../lib/firebase';
+import { onAuthStateChanged } from 'firebase/auth';
 
 interface AuthState {
   isAuthenticated: boolean;
   user: User | null;
   tempUser: User | null;
+  loading: boolean;
   login: (email: string, password: string) => Promise<boolean>;
-  signup: (email: string, password: string) => Promise<boolean>;
+  signup: (email: string, password: string, name?: string) => Promise<boolean>;
   logout: () => void;
-  checkAuth: () => void;
+  initAuth: () => () => void;
   setUser: (user: User | null) => void;
   setTempUser: (tempUser: User | null) => void;
 }
-
-// In a real app, this would be handled by an API call
 
 const useAuthStore = create<AuthState>((set) => ({
   isAuthenticated: false,
   user: null,
   tempUser: null,
-  
+  loading: true,
+
   login: async (email, password) => {
     try {
-      const user:any = await signIn(email, password);
-      
-      if (user) {
+      const firebaseUser: any = await signIn(email, password);
+      if (firebaseUser) {
+        const user: User = {
+          id: firebaseUser.uid,
+          name: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'User',
+          email: firebaseUser.email || '',
+        };
         set({ isAuthenticated: true, user });
         return true;
       }
-      
       return false;
     } catch (error) {
       console.error('Login error:', error);
       return false;
     }
   },
-  
-  signup: async (email, password) => {
+
+  signup: async (email, password, name) => {
     try {
-      const user:any = await createUser(email, password)
-      set({ isAuthenticated: true, user });
-      return true;
+      const firebaseUser: any = await createUser(email, password, name);
+      if (firebaseUser) {
+        const user: User = {
+          id: firebaseUser.uid,
+          name: name || firebaseUser.email?.split('@')[0] || 'User',
+          email: firebaseUser.email || '',
+        };
+        set({ isAuthenticated: true, user });
+        return true;
+      }
+      return false;
     } catch (error) {
       console.error('Signup error:', error);
       return false;
     }
   },
-  
+
   logout: () => {
-    logout()
-    set({ isAuthenticated: false, user: null });
+    firebaseLogout();
+    set({ isAuthenticated: false, user: null, tempUser: null });
   },
 
-  setUser: async (user) => set({user}),
-  setTempUser: async (tempUser) => set({tempUser}),
-  
-  checkAuth: () => {
-    const authData = localStorage.getItem('auth');
-    
-    if (authData) {
-      try {
-        const { user, isAuthenticated } = JSON.parse(authData);
-        set({ user, isAuthenticated });
-      } catch (error) {
-        console.error('Error parsing auth data:', error);
-        localStorage.removeItem('auth');
+  /**
+   * Subscribe to Firebase auth state. Call once at app root.
+   * Returns an unsubscribe function.
+   */
+  initAuth: () => {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (firebaseUser) {
+        const user: User = {
+          id: firebaseUser.uid,
+          name: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'User',
+          email: firebaseUser.email || '',
+        };
+        set({ isAuthenticated: true, user, loading: false });
+      } else {
+        set({ isAuthenticated: false, user: null, loading: false });
       }
-    }
+    });
+    return unsubscribe;
   },
+
+  setUser: (user) => set({ user }),
+  setTempUser: (tempUser) => set({ tempUser }),
 }));
 
 export default useAuthStore;

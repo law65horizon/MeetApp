@@ -1,270 +1,400 @@
-import { useState, useRef, useEffect } from 'react';
+/**
+ * ChatPanel.tsx
+ *
+ * Real-time in-meeting chat panel.
+ * Messages flow via socket.io — no persistence, ephemeral per session.
+ *
+ * Features:
+ *  - Send/receive text messages
+ *  - Sender name + timestamp on every message
+ *  - Own messages right-aligned, others left-aligned
+ *  - Emoji picker (native browser emoji keyboard via input type tricks +
+ *    a lightweight custom grid for quick access)
+ *  - Auto-scroll to latest message
+ *  - Unread badge clears when panel opens
+ */
+
+import React, {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  KeyboardEvent,
+} from "react";
 import {
   Box,
-  Typography,
-  TextField,
   IconButton,
-  Divider,
-  Avatar,
-  List,
-  ListItem,
-  Paper,
-  InputAdornment,
-  useTheme,
-  useMediaQuery,
-  FormControl,
-  InputLabel,
-  Select,
-  MenuItem,
-  SelectChangeEvent
-} from '@mui/material';
-import { SendHorizontal, X } from 'lucide-react';
-import { useNewMeetingStore } from '../../store/newMeetingStore'; 
-import { ChatMessage, Participant } from '../../types';
+  InputBase,
+  Typography,
+  Tooltip,
+} from "@mui/material";
+import { X, Send, Smile } from "lucide-react";
+import { useNewMeetingStore } from "../../store/newMeetingStore";
+import useAuthStore from "../../store/authStore";
+
+// ── Quick-access emoji set ────────────────────────────────────────────────────
+const QUICK_EMOJIS = [
+  "😀","😂","😍","🤔","😮","😢","😡","👍","👎","👋",
+  "🎉","🔥","❤️","💯","✅","🙏","😎","🤣","😅","🥳",
+  "👏","💪","🚀","⭐","💡","🤝","😬","🙄","😴","🤦",
+];
 
 interface ChatPanelProps {
-  isOpen: boolean;
   onClose: () => void;
+  isOpen: boolean;
 }
 
-// Helper function to format timestamp - moved outside components to be accessible
-const formatTimestamp = (timestamp: string) => {
-  const date = new Date(timestamp);
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-};
+const ChatPanel: React.FC<ChatPanelProps> = ({ onClose, isOpen }) => {
+  const messages = useNewMeetingStore((s) => s.chatMessages);
+  const clearUnread = useNewMeetingStore((s) => s.clearUnreadMessages);
+  const sendMessage = useNewMeetingStore((s) => s.sendChatMessage);
+  const tempUser = useAuthStore((s) => s.tempUser);
 
-// Helper function to get alpha color
-function alpha(color: string, opacity: number): string {
-  // Simple implementation for hex colors
-  if (color.startsWith('#')) {
-    return `${color}${Math.round(opacity * 255).toString(16).padStart(2, '0')}`;
-  }
-  return `rgba(${color}, ${opacity})`;
-}
+  const [text, setText] = useState("");
+  const [emojiOpen, setEmojiOpen] = useState(false);
 
-const ChatPanel = ({ isOpen, onClose }: ChatPanelProps) => {
-  const theme = useTheme();
-  const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
-  const { messages, participants, sendMessage } = useNewMeetingStore();
-  const [messageText, setMessageText] = useState('');
-  const [isPrivate, setIsPrivate] = useState(false);
-  const [recipientId, setRecipientId] = useState('everyone');
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
+  // Clear unread count when panel opens
   useEffect(() => {
-    if (isOpen && messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (isOpen) {
+      clearUnread();
+      inputRef.current?.focus();
     }
-  }, [isOpen, messages]);
+  }, [isOpen, clearUnread]);
 
-  const handleSendMessage = () => {
-    if (messageText.trim()) {
-      if (isPrivate && recipientId !== 'everyone') {
-        sendMessage(messageText, true, recipientId);
-      } else {
-        sendMessage(messageText, false);
-      }
-      setMessageText('');
+  // Auto-scroll on new messages
+  useEffect(() => {
+    if (isOpen) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  };
+  }, [messages, isOpen]);
 
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+  const handleSend = useCallback(() => {
+    const trimmed = text.trim();
+    if (!trimmed || !tempUser) return;
+    sendMessage(trimmed);
+    setText("");
+    setEmojiOpen(false);
+    inputRef.current?.focus();
+  }, [text, sendMessage, tempUser]);
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSendMessage();
+      handleSend();
     }
   };
 
-  const handleRecipientChange = (event: SelectChangeEvent) => {
-    const value = event.target.value;
-    setRecipientId(value);
-    setIsPrivate(value !== 'everyone');
+  const addEmoji = (emoji: string) => {
+    setText((t) => t + emoji);
+    inputRef.current?.focus();
+  };
+
+  const formatTime = (ts: number) => {
+    const d = new Date(ts);
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   };
 
   return (
     <Box
       sx={{
-        display: 'flex',
-        flexDirection: 'column',
-        height: '100%',
-        width: '100%',
-        backgroundColor: 'background.paper',
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        bgcolor: "#0f172a",
+        fontFamily: "'Sora', sans-serif",
       }}
     >
-      {/* Chat header */}
+      {/* ── Header ── */}
       <Box
         sx={{
-          p: 2,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          borderBottom: 1,
-          borderColor: 'divider',
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          px: 2,
+          py: 1.5,
+          borderBottom: "1px solid rgba(255,255,255,0.07)",
+          flexShrink: 0,
         }}
       >
-        <Typography variant="h6">Chat</Typography>
-        <IconButton onClick={onClose} edge="end">
-          <X size={20} />
+        <Typography
+          sx={{
+            fontFamily: "'Sora', sans-serif",
+            fontWeight: 700,
+            fontSize: "0.95rem",
+            color: "#e2e8f0",
+            letterSpacing: "-0.01em",
+          }}
+        >
+          Chat
+        </Typography>
+        <IconButton
+          size="small"
+          onClick={onClose}
+          sx={{ color: "#64748b", "&:hover": { color: "#e2e8f0" } }}
+        >
+          <X size={18} />
         </IconButton>
       </Box>
 
-      {/* Messages list */}
-      <List
+      {/* ── Message list ── */}
+      <Box
         sx={{
           flex: 1,
-          overflowY: 'auto',
-          p: 2,
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 2,
+          overflowY: "auto",
+          px: 2,
+          py: 1.5,
+          display: "flex",
+          flexDirection: "column",
+          gap: 1.5,
+          // Custom scrollbar
+          "&::-webkit-scrollbar": { width: 4 },
+          "&::-webkit-scrollbar-track": { bgcolor: "transparent" },
+          "&::-webkit-scrollbar-thumb": {
+            bgcolor: "rgba(255,255,255,0.1)",
+            borderRadius: 2,
+          },
         }}
       >
-        {messages.map((message) => (
-          <MessageItem 
-            key={message.id} 
-            message={message} 
-            participants={participants} 
-          />
-        ))}
-        <div ref={messagesEndRef} />
-      </List>
-
-      {/* Message input */}
-      <Box
-        component={Paper}
-        elevation={0}
-        sx={{
-          p: 2,
-          borderTop: 1,
-          borderColor: 'divider',
-        }}
-      >
-        <FormControl 
-          variant="outlined" 
-          size="small" 
-          fullWidth 
-          sx={{ mb: 2 }}
-        >
-          <InputLabel id="message-recipient-label">To</InputLabel>
-          <Select
-            labelId="message-recipient-label"
-            id="message-recipient"
-            value={recipientId}
-            onChange={handleRecipientChange}
-            label="To"
+        {messages.length === 0 && (
+          <Box
+            sx={{
+              flex: 1,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 1,
+              opacity: 0.4,
+              mt: 8,
+            }}
           >
-            <MenuItem value="everyone">Everyone</MenuItem>
-            {participants.map((participant) => (
-              <MenuItem key={participant.id} value={participant.id}>
-                {participant.name} {participant.isHost ? '(Host)' : ''}
-              </MenuItem>
-            ))}
-          </Select>
-        </FormControl>
-        
-        <TextField
-          fullWidth
-          variant="outlined"
-          placeholder="Type a message..."
-          value={messageText}
-          onChange={(e) => setMessageText(e.target.value)}
-          onKeyPress={handleKeyPress}
-          multiline
-          maxRows={3}
-          InputProps={{
-            endAdornment: (
-              <InputAdornment position="end">
-                <IconButton
-                  edge="end"
-                  onClick={handleSendMessage}
-                  disabled={!messageText.trim()}
-                  color="primary"
-                >
-                  <SendHorizontal size={20} />
-                </IconButton>
-              </InputAdornment>
-            ),
-          }}
-        />
-        {isPrivate && recipientId !== 'everyone' && (
-          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-            This message will only be visible to the selected recipient
-          </Typography>
-        )}
-      </Box>
-    </Box>
-  );
-};
-
-interface MessageItemProps {
-  message: ChatMessage;
-  participants: Participant[];
-}
-
-const MessageItem = ({ message, participants }: MessageItemProps) => {
-  const theme = useTheme();
-  
-  // Get current user ID from localStorage
-  const currentUserId = JSON.parse(localStorage.getItem('user') || '{}').id;
-  
-  // Check if this message is from or to the current user
-  const isFromCurrentUser = message.senderId === currentUserId;
-  const isPrivateToCurrentUser = message.isPrivate && message.recipientId === currentUserId;
-  
-  // Get recipient name for private messages
-  let recipientName = '';
-  if (message.isPrivate && message.recipientId) {
-    const recipient = participants.find(p => p.id === message.recipientId);
-    recipientName = recipient?.name || 'Unknown';
-  }
-
-  return (
-    <ListItem
-      alignItems="flex-start"
-      disableGutters
-      disablePadding
-      sx={{
-        mb: 1,
-        backgroundColor: message.isPrivate 
-          ? (isFromCurrentUser || isPrivateToCurrentUser 
-              ? alpha(theme.palette.primary.main, 0.1)
-              : 'transparent')
-          : 'transparent',
-        borderRadius: 1,
-        p: message.isPrivate ? 1 : 0,
-      }}
-    >
-      <Box sx={{ display: 'flex', width: '100%' }}>
-        <Avatar
-          src={message.senderAvatar}
-          alt={message.senderName}
-          sx={{ width: 32, height: 32, mr: 1 }}
-        />
-        <Box sx={{ flex: 1 }}>
-          <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
-            <Typography variant="subtitle2" component="span">
-              {message.senderName} 
-              {isFromCurrentUser && ' (You)'}
-            </Typography>
-            <Typography variant="caption" color="text.secondary">
-              {formatTimestamp(message.timestamp)}
+            <Typography sx={{ fontSize: "2rem" }}>💬</Typography>
+            <Typography
+              sx={{
+                color: "#94a3b8",
+                fontSize: "0.8rem",
+                fontFamily: "'Sora', sans-serif",
+              }}
+            >
+              No messages yet
             </Typography>
           </Box>
-          
-          {message.isPrivate && (
-            <Typography variant="caption" color="primary" sx={{ display: 'block', mb: 0.5 }}>
-              {isFromCurrentUser 
-                ? `Private to ${recipientName}` 
-                : 'Private message to you'}
-            </Typography>
-          )}
-          
-          <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
-            {message.content}
-          </Typography>
-        </Box>
+        )}
+
+        {messages.map((msg) => {
+          const isOwn = msg.senderId === tempUser?.id;
+          return (
+            <Box
+              key={msg.id}
+              sx={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: isOwn ? "flex-end" : "flex-start",
+              }}
+            >
+              {/* Sender + time */}
+              <Box
+                sx={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 0.75,
+                  mb: 0.4,
+                  flexDirection: isOwn ? "row-reverse" : "row",
+                }}
+              >
+                <Typography
+                  sx={{
+                    fontSize: "0.7rem",
+                    fontWeight: 600,
+                    color: isOwn ? "#6ee7b7" : "#94a3b8",
+                    fontFamily: "'Sora', sans-serif",
+                  }}
+                >
+                  {isOwn ? "You" : msg.senderName}
+                </Typography>
+                <Typography
+                  sx={{
+                    fontSize: "0.65rem",
+                    color: "#475569",
+                    fontFamily: "monospace",
+                  }}
+                >
+                  {formatTime(msg.timestamp)}
+                </Typography>
+              </Box>
+
+              {/* Bubble */}
+              <Box
+                sx={{
+                  maxWidth: "78%",
+                  px: 1.5,
+                  py: 1,
+                  borderRadius: isOwn
+                    ? "16px 16px 4px 16px"
+                    : "16px 16px 16px 4px",
+                  bgcolor: isOwn
+                    ? "rgba(110,231,183,0.15)"
+                    : "rgba(255,255,255,0.07)",
+                  border: isOwn
+                    ? "1px solid rgba(110,231,183,0.2)"
+                    : "1px solid rgba(255,255,255,0.06)",
+                  wordBreak: "break-word",
+                }}
+              >
+                <Typography
+                  sx={{
+                    fontSize: "0.85rem",
+                    color: "#e2e8f0",
+                    lineHeight: 1.5,
+                    fontFamily: "'Sora', sans-serif",
+                    whiteSpace: "pre-wrap",
+                  }}
+                >
+                  {msg.content}
+                </Typography>
+              </Box>
+            </Box>
+          );
+        })}
+
+        <div ref={bottomRef} />
       </Box>
-    </ListItem>
+
+      {/* ── Emoji picker ── */}
+      {emojiOpen && (
+        <Box
+          sx={{
+            mx: 2,
+            mb: 1,
+            p: 1.5,
+            bgcolor: "rgba(15,23,42,0.98)",
+            border: "1px solid rgba(255,255,255,0.08)",
+            borderRadius: 2,
+            display: "grid",
+            gridTemplateColumns: "repeat(10, 1fr)",
+            gap: 0.5,
+            flexShrink: 0,
+          }}
+        >
+          {QUICK_EMOJIS.map((emoji) => (
+            <Box
+              key={emoji}
+              onClick={() => addEmoji(emoji)}
+              sx={{
+                fontSize: "1.2rem",
+                cursor: "pointer",
+                textAlign: "center",
+                lineHeight: "32px",
+                borderRadius: 1,
+                transition: "background 0.15s",
+                "&:hover": { bgcolor: "rgba(255,255,255,0.1)" },
+                userSelect: "none",
+              }}
+            >
+              {emoji}
+            </Box>
+          ))}
+        </Box>
+      )}
+
+      {/* ── Input bar ── */}
+      <Box
+        sx={{
+          display: "flex",
+          alignItems: "center",
+          gap: 0.5,
+          px: 1.5,
+          py: 1.25,
+          borderTop: "1px solid rgba(255,255,255,0.07)",
+          flexShrink: 0,
+        }}
+      >
+        <Tooltip title="Emoji" arrow>
+          <IconButton
+            size="small"
+            onClick={() => setEmojiOpen((v) => !v)}
+            sx={{
+              color: emojiOpen ? "#6ee7b7" : "#64748b",
+              "&:hover": { color: "#6ee7b7" },
+              transition: "color 0.2s",
+            }}
+          >
+            <Smile size={18} />
+          </IconButton>
+        </Tooltip>
+
+        <Box
+          sx={{
+            flex: 1,
+            bgcolor: "rgba(255,255,255,0.06)",
+            border: "1px solid rgba(255,255,255,0.08)",
+            borderRadius: "12px",
+            px: 1.5,
+            py: 0.75,
+            display: "flex",
+            alignItems: "center",
+            transition: "border-color 0.2s",
+            "&:focus-within": {
+              borderColor: "rgba(110,231,183,0.4)",
+            },
+          }}
+        >
+          <InputBase
+            inputRef={inputRef}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Send a message…"
+            multiline
+            maxRows={4}
+            fullWidth
+            sx={{
+              color: "#e2e8f0",
+              fontSize: "0.85rem",
+              fontFamily: "'Sora', sans-serif",
+              "& .MuiInputBase-input::placeholder": {
+                color: "#475569",
+                opacity: 1,
+              },
+            }}
+          />
+        </Box>
+
+        <Tooltip title="Send (Enter)" arrow>
+          <span>
+            <IconButton
+              size="small"
+              onClick={handleSend}
+              disabled={!text.trim()}
+              sx={{
+                color: text.trim() ? "#6ee7b7" : "#334155",
+                bgcolor: text.trim()
+                  ? "rgba(110,231,183,0.12)"
+                  : "transparent",
+                border: "1px solid",
+                borderColor: text.trim()
+                  ? "rgba(110,231,183,0.2)"
+                  : "transparent",
+                borderRadius: "50%",
+                width: 34,
+                height: 34,
+                transition: "all 0.2s",
+                "&:hover": {
+                  bgcolor: text.trim()
+                    ? "rgba(110,231,183,0.22)"
+                    : "transparent",
+                },
+              }}
+            >
+              <Send size={15} />
+            </IconButton>
+          </span>
+        </Tooltip>
+      </Box>
+    </Box>
   );
 };
 

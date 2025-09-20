@@ -1,28 +1,16 @@
 /**
  * MeetingRoom.tsx
  *
- * Double-connect root cause: `start` was in the useEffect dependency array.
- * `start` is a useCallback that recreates when `tempUser` changes, so the
- * effect fired twice — once on mount, once when tempUser resolved. For
- * authenticated users the `await getIdToken()` added enough delay that the
- * cleanup from the first run could reset `didInitRef` before the second run
- * checked it. For guests there is no await, so both runs happened synchronously
- * and both passed the guard.
+ * Connects to the mediasoup server via Socket.IO, manages WebRTC transports,
+ * producers, consumers, and the in-meeting chat.
  *
- * Fix: store `start` in a ref (`startRef`) and keep it current on every render.
- * The bootstrap effect depends only on [roomId, tempUser] — stable values that
- * only change when the user actually navigates to a different room or signs in.
- * The effect body calls `startRef.current()` so it always uses the latest
- * closure without needing `start` as a dependency.
+ * Key invariants:
+ * - Socket is created exactly once per (roomId, tempUser) pair.
+ * - `start` is stored in a ref to avoid it being a useEffect dependency.
+ * - All media cleanup happens in the effect's cleanup function.
  */
 
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Box,
   AppBar,
@@ -32,21 +20,23 @@ import {
   useMediaQuery,
   useTheme,
   CircularProgress,
-} from "@mui/material";
-import { useParams, useNavigate } from "react-router-dom";
-import io, { Socket } from "socket.io-client";
-import * as mediasoupClient from "mediasoup-client";
-import { ArrowLeft, Clock } from "lucide-react";
-import VideoGrid from "../../components/video/VideoGrid";
-import MeetingControls from "../../components/meeting/MeetingControls";
-import useMeetingStore from "../../store/meetingStore";
-import useAuthStore from "../../store/authStore";
-import { useAuth } from "../../hooks/useAuth";
-import { useNewMeetingStore } from "../../store/newMeetingStore";
-import { ChatMessage, Participant, User } from "../../types";
-import { auth } from "../../lib/firebase";
+  Snackbar,
+  Alert,
+} from '@mui/material';
+import { useParams, useNavigate } from 'react-router-dom';
+import io, { Socket } from 'socket.io-client';
+import * as mediasoupClient from 'mediasoup-client';
+import { ArrowLeft, Clock } from 'lucide-react';
+import VideoGrid from '../../components/video/VideoGrid';
+import MeetingControls from '../../components/meeting/MeetingControls';
+import useMeetingStore from '../../store/meetingStore';
+import useAuthStore from '../../store/authStore';
+import { useAuth } from '../../hooks/useAuth';
+import { useNewMeetingStore } from '../../store/newMeetingStore';
+import { ChatMessage, Participant, User } from '../../types';
+import { auth } from '../../lib/firebase';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3000';
 
 interface TransportData {
   id: string;
@@ -72,9 +62,7 @@ interface NewProducerData {
   appData?: Record<string, any>;
 }
 
-// ─── Component ────────────────────────────────────────────────────────────────
-
-const App: React.FC = () => {
+const MeetingRoom: React.FC = () => {
   const { user } = useAuth();
   const tempUser = useAuthStore((s) => s.tempUser);
   const pps = useMeetingStore((s) => s.participants);
@@ -82,16 +70,21 @@ const App: React.FC = () => {
   const setPPs = useMeetingStore((s) => s.setParticipants);
   const setCallbacks = useNewMeetingStore((s) => s.setCallbacks);
   const receiveMessage = useNewMeetingStore((s) => s.receiveMessage);
-  const clearMeetingSettings = useNewMeetingStore((s) => s.clearMeeting)
+  const clearMeetingSettings = useNewMeetingStore((s) => s.clearMeeting);
   const setSendChatCallback = useNewMeetingStore((s) => s.setSendChatCallback);
   const setTempUser = useAuthStore((s) => s.setTempUser);
+  const unreadMessages = useNewMeetingStore((s) => s.unreadMessageCount);
+  const setChatOpen = useNewMeetingStore((s) => s.setChatOpen);
+  const isChatOpen = useNewMeetingStore((s) => s.isChatOpen);
 
+  const {isAudioMuted, isVideoEnabled} = useNewMeetingStore()
+
+  console.log({pps, isAudioMuted, isVideoEnabled, isChatOpen})
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
   const theme = useTheme();
-  const isMobile = useMediaQuery(theme.breakpoints.down("md"));
+  const isMobile = useMediaQuery(theme.breakpoints.down('md'));
 
-  // ── WebRTC infra refs ──────────────────────────────────────────────────────
   const socketRef = useRef<typeof Socket | null>(null);
   const deviceRef = useRef<mediasoupClient.Device | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -100,34 +93,28 @@ const App: React.FC = () => {
   const videoProducerRef = useRef<mediasoupClient.types.Producer | null>(null);
   const consumerMapRef = useRef<Map<string, mediasoupClient.types.Consumer>>(new Map());
   const peerProducersRef = useRef<Map<string, Set<string>>>(new Map());
-
-  // ── Guard: prevents double-connect regardless of sync/async timing ─────────
   const didInitRef = useRef(false);
 
-  // ── State ──────────────────────────────────────────────────────────────────
   const [streams, setStreams] = useState<{ [peerId: string]: MediaStream }>({});
   const [elapsedTime, setElapsedTime] = useState(0);
-  const [loading] = useState(false);
-  const [unreadMessages] = useState(0);
+  const [connectError, setConnectError] = useState('');
 
-  // ── Timer ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     const id = setInterval(() => setElapsedTime((t) => t + 1), 1000);
     return () => clearInterval(id);
   }, []);
 
-  // ── Resolve tempUser from auth or session ──────────────────────────────────
   useEffect(() => {
     if (!tempUser) {
-      const id = user?.uid || sessionStorage.getItem("guestUserId");
+      const id = user?.id || sessionStorage.getItem('guestUserId');
       if (!id) return;
       setTempUser({
         id,
         name:
-          user?.displayName ||
-          user?.email?.split("@")[0] ||
-          sessionStorage.getItem("guestFullname") ||
-          "Guest",
+          user?.name ||
+          (user as any)?.email?.split('@')[0] ||
+          sessionStorage.getItem('guestFullname') ||
+          'Guest',
       } as User);
     }
   }, [user]);
@@ -136,55 +123,57 @@ const App: React.FC = () => {
     const h = Math.floor(elapsedTime / 3600);
     const m = Math.floor((elapsedTime % 3600) / 60);
     const s = elapsedTime % 60;
-    return `${h > 0 ? `${h}:` : ""}${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    return `${h > 0 ? `${h}:` : ''}${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   };
 
-  const leaveMeeting = () => {
-    setPPs([])
-    clearMeetingSettings()
-    navigate('/dashboard')
-  }
+  const leaveMeeting = useCallback(() => {
+    setPPs([]);
+    clearMeetingSettings();
+    navigate('/');
+  }, [navigate, setPPs, clearMeetingSettings]);
 
-  // ── upsertTrack ────────────────────────────────────────────────────────────
   const upsertTrack = useCallback((peerId: string, track: MediaStreamTrack) => {
     setStreams((prev) => {
-      const old = prev[peerId];
-      const kept = old ? old.getTracks().filter((t) => t.kind !== track.kind) : [];
-      return { ...prev, [peerId]: new MediaStream([...kept, track]) };
+      const existing = prev[peerId];
+      if (existing) {
+        if (track.kind === 'video') {
+          existing.getVideoTracks().forEach((t) => { existing.removeTrack(t); t.stop(); });
+        } else {
+          existing.getAudioTracks().forEach((t) => { existing.removeTrack(t); t.stop(); });
+        }
+        existing.addTrack(track);
+        return { ...prev, [peerId]: existing };
+      }
+      const stream = new MediaStream([track]);
+      return { ...prev, [peerId]: stream };
     });
   }, []);
 
-  // ── Media controls ─────────────────────────────────────────────────────────
-
   const handleToggleAudio = useCallback(
-    async (muted: boolean) => {
-      const track = localStreamRef.current?.getAudioTracks()[0];
-      if (track) track.enabled = !muted;
+    (enabled: boolean) => {
       const p = audioProducerRef.current;
       if (!p) return;
-      if (muted) {
+      if (!enabled) {
         p.pause();
-        socketRef.current?.emit("pauseProducer", { roomId, producerId: p.id });
+        socketRef.current?.emit('pauseProducer', { roomId, producerId: p.id });
       } else {
         p.resume();
-        socketRef.current?.emit("resumeProducer", { roomId, producerId: p.id });
+        socketRef.current?.emit('resumeProducer', { roomId, producerId: p.id });
       }
     },
     [roomId]
   );
 
   const handleToggleVideo = useCallback(
-    async (enabled: boolean) => {
-      const track = localStreamRef.current?.getVideoTracks()[0];
-      if (track) track.enabled = enabled;
+    (enabled: boolean) => {
       const p = videoProducerRef.current;
       if (!p) return;
       if (!enabled) {
         p.pause();
-        socketRef.current?.emit("pauseProducer", { roomId, producerId: p.id });
+        socketRef.current?.emit('pauseProducer', { roomId, producerId: p.id });
       } else {
         p.resume();
-        socketRef.current?.emit("resumeProducer", { roomId, producerId: p.id });
+        socketRef.current?.emit('resumeProducer', { roomId, producerId: p.id });
       }
     },
     [roomId]
@@ -208,8 +197,7 @@ const App: React.FC = () => {
           });
           localStreamRef.current.addTrack(freshTrack);
         }
-        const producer = videoProducerRef.current;
-        if (producer) await producer.replaceTrack({ track: freshTrack });
+        if (videoProducerRef.current) await videoProducerRef.current.replaceTrack({ track: freshTrack });
         upsertTrack(tempUser.id, freshTrack);
       };
 
@@ -225,7 +213,7 @@ const App: React.FC = () => {
           await p.replaceTrack({ track: screenTrack });
           upsertTrack(tempUser.id, screenTrack);
         } catch (err) {
-          console.error("Screen share error:", err);
+          console.error('Screen share error:', err);
           useNewMeetingStore.getState().setScreenSharing(false);
         }
       } else {
@@ -243,8 +231,6 @@ const App: React.FC = () => {
     });
   }, [handleToggleAudio, handleToggleVideo, handleToggleScreenShare, setCallbacks]);
 
-  // ── start() ────────────────────────────────────────────────────────────────
-
   const start = useCallback(async () => {
     if (!socketRef.current || !deviceRef.current || !tempUser) return;
 
@@ -252,12 +238,12 @@ const App: React.FC = () => {
     const device = deviceRef.current;
     const myPeerId = tempUser.id;
 
-    socket.removeEventListener("newProducer");
-    socket.removeEventListener("peerLeft");
-    socket.removeEventListener("peerJoined");
-    socket.removeEventListener("consumerClosed");
-    socket.removeEventListener("producerClosed");
-    socket.removeEventListener("chatMessage");
+    socket.removeEventListener('newProducer');
+    socket.removeEventListener('peerLeft');
+    socket.removeEventListener('peerJoined');
+    socket.removeEventListener('consumerClosed');
+    socket.removeEventListener('producerClosed');
+    socket.removeEventListener('chatMessage');
 
     let recvTransport: mediasoupClient.types.Transport | null = null;
     let recvTransportId: string | null = null;
@@ -267,7 +253,7 @@ const App: React.FC = () => {
       if (recvTransport) return Promise.resolve();
       if (recvTransportCreating) return recvTransportCreating;
       recvTransportCreating = new Promise<void>((resolve, reject) => {
-        socket.emit("createWebRtcTransport", { roomId, direction: "recv" }, (params: TransportData) => {
+        socket.emit('createWebRtcTransport', { roomId, direction: 'recv' }, (params: TransportData) => {
           if (params.error) return reject(new Error(params.error));
           recvTransportId = params.id;
           const t = device.createRecvTransport({
@@ -277,8 +263,8 @@ const App: React.FC = () => {
             dtlsParameters: params.dtlsParameters,
             iceServers: params.iceServers ?? [],
           });
-          t.on("connect", ({ dtlsParameters: dp }, cb, errback) => {
-            socket.emit("connectTransport", { roomId, transportId: params.id, dtlsParameters: dp },
+          t.on('connect', ({ dtlsParameters: dp }, cb, errback) => {
+            socket.emit('connectTransport', { roomId, transportId: params.id, dtlsParameters: dp },
               (res: any) => (res.error ? errback(new Error(res.error)) : cb()));
           });
           recvTransport = t;
@@ -291,7 +277,7 @@ const App: React.FC = () => {
     async function consume(producerId: string, kind: string, peerId: string): Promise<void> {
       if (!recvTransport || !recvTransportId) return;
       return new Promise<void>((resolve) => {
-        socket.emit("consume", {
+        socket.emit('consume', {
           roomId,
           consumerTransportId: recvTransportId,
           producerId,
@@ -307,11 +293,11 @@ const App: React.FC = () => {
           consumerMapRef.current.set(producerId, consumer);
           if (!peerProducersRef.current.has(peerId)) peerProducersRef.current.set(peerId, new Set());
           peerProducersRef.current.get(peerId)!.add(producerId);
-          socket.emit("consumerResume", { roomId, consumerId: consumer.id }, async (res: any) => {
+          socket.emit('consumerResume', { roomId, consumerId: consumer.id }, async (res: any) => {
             if (res.error) return resolve();
             await consumer.resume();
-            if (kind === "video") {
-              setTimeout(() => socket.emit("requestKeyFrame", { roomId, consumerId: consumer.id }), 150);
+            if (kind === 'video') {
+              setTimeout(() => socket.emit('requestKeyFrame', { roomId, consumerId: consumer.id }), 150);
             }
             upsertTrack(peerId, consumer.track);
             consumer.track.onunmute = () => upsertTrack(peerId, consumer.track);
@@ -321,19 +307,18 @@ const App: React.FC = () => {
       });
     }
 
-    // Register ALL listeners BEFORE any emits
-    socket.on("newProducer", async ({ producerId, kind, appData: ad }: NewProducerData) => {
-      const peerId: string = ad?.peerId ?? "unknown";
+    socket.on('newProducer', async ({ producerId, kind, appData: ad }: NewProducerData) => {
+      const peerId: string = ad?.peerId ?? 'unknown';
       if (peerId === myPeerId) return;
       await ensureRecvTransport();
       await consume(producerId, kind, peerId);
     });
 
-    socket.on("peerJoined", ({ peerId, peerUserName }: { peerId: string; peerUserName: string }) => {
-      if (peerId) setPPs((prev) => [...prev, { id: peerId, name: peerUserName ?? "Guest" }]);
+    socket.on('peerJoined', ({ peerId, peerUserName }: { peerId: string; peerUserName: string }) => {
+      if (peerId) setPPs((prev) => [...prev, { id: peerId, name: peerUserName ?? 'Guest' }]);
     });
 
-    socket.on("peerLeft", ({ peerId, producerIds }: { peerId: string; producerIds: string[] }) => {
+    socket.on('peerLeft', ({ peerId, producerIds }: { peerId: string; producerIds: string[] }) => {
       if (peerId === myPeerId) return;
       const tracked = peerProducersRef.current.get(peerId);
       const toClose = tracked ? [...tracked] : (producerIds ?? []);
@@ -343,17 +328,17 @@ const App: React.FC = () => {
       setPPs((prev: Participant[]) => prev.filter((p: Participant) => p.id !== peerId));
     });
 
-    socket.on("consumerClosed", ({ producerId }: { producerId: string }) => {
+    socket.on('consumerClosed', ({ producerId }: { producerId: string }) => {
       consumerMapRef.current.get(producerId)?.close();
       consumerMapRef.current.delete(producerId);
     });
 
-    socket.on("producerClosed", ({ producerId }: { producerId: string }) => {
+    socket.on('producerClosed', ({ producerId }: { producerId: string }) => {
       consumerMapRef.current.get(producerId)?.close();
       consumerMapRef.current.delete(producerId);
     });
 
-    socket.on("chatMessage", (msg: ChatMessage) => receiveMessage(msg));
+    socket.on('chatMessage', (msg: ChatMessage) => receiveMessage(msg));
 
     setSendChatCallback((text: string) => {
       if (!text.trim()) return;
@@ -366,7 +351,7 @@ const App: React.FC = () => {
         isPrivate: false,
       };
       receiveMessage(msg);
-      socket.emit("sendMessage", { roomId, message: msg });
+      socket.emit('sendMessage', { roomId, message: msg });
     });
 
     // Local media
@@ -378,13 +363,13 @@ const App: React.FC = () => {
       localStreamRef.current = stream;
       setStreams((prev) => ({ ...prev, [myPeerId]: stream }));
     } catch (err) {
-      console.error("[start] getUserMedia error:", err);
+      console.error('[start] getUserMedia error:', err);
     }
 
     // Send transport + produce
     try {
       await new Promise<void>((resolveSendTransport) => {
-        socket.emit("createWebRtcTransport", { roomId, direction: "send" }, async (params: TransportData) => {
+        socket.emit('createWebRtcTransport', { roomId, direction: 'send' }, async (params: TransportData) => {
           if (params.error) return resolveSendTransport();
           const sendTransportId = params.id;
           const t = device.createSendTransport({
@@ -394,12 +379,12 @@ const App: React.FC = () => {
             dtlsParameters: params.dtlsParameters,
             iceServers: params.iceServers ?? [],
           });
-          t.on("connect", ({ dtlsParameters: dp }, cb, errback) => {
-            socket.emit("connectTransport", { roomId, transportId: sendTransportId, dtlsParameters: dp },
+          t.on('connect', ({ dtlsParameters: dp }, cb, errback) => {
+            socket.emit('connectTransport', { roomId, transportId: sendTransportId, dtlsParameters: dp },
               (res: any) => (res.error ? errback(new Error(res.error)) : cb()));
           });
-          t.on("produce", ({ kind, rtpParameters, appData: ad }, cb, errback) => {
-            socket.emit("produce", {
+          t.on('produce', ({ kind, rtpParameters, appData: ad }, cb, errback) => {
+            socket.emit('produce', {
               roomId, transportId: sendTransportId, kind, rtpParameters,
               appData: { ...ad, peerId: myPeerId },
             }, (res: any) => (res.error ? errback(new Error(res.error)) : cb({ id: res.id })));
@@ -407,9 +392,25 @@ const App: React.FC = () => {
           if (localStreamRef.current) {
             const audioTrack = localStreamRef.current.getAudioTracks()[0];
             const videoTrack = localStreamRef.current.getVideoTracks()[0];
+
+            // if (audioTrack) {
+            //   audioTrack.enabled = !isAudioMuted
+            // }
+            // if (videoTrack) {
+            //   videoTrack.enabled = isVideoEnabled
+            // }
             if (audioTrack) {
-              try { audioProducerRef.current = await t.produce({ track: audioTrack }); }
-              catch (e) { console.error("[produce] audio failed:", e); }
+              try { 
+                audioProducerRef.current = await t.produce({ track: audioTrack }); 
+                if (isAudioMuted) {
+                  audioProducerRef.current.pause();
+                  socket.emit('pauseProducer', {
+                    roomId,
+                    producerId: audioProducerRef.current.id
+                  })
+                }
+              }
+              catch (e) { console.error('[produce] audio failed:', e); }
             }
             if (videoTrack) {
               try {
@@ -422,36 +423,34 @@ const App: React.FC = () => {
                   ],
                   codecOptions: { videoGoogleStartBitrate: 1000 },
                 });
-              } catch (e) { console.error("[produce] video failed:", e); }
+
+                if (!isVideoEnabled) {
+                  videoProducerRef.current.pause();
+                  socket.emit('pauseProducer', {
+                    roomId,
+                    producerId: videoProducerRef.current.id
+                  })
+                }
+              } catch (e) { console.error('[produce] video failed:', e); }
             }
           }
           resolveSendTransport();
         });
       });
 
-      socket.emit("getProducers", { roomId, clientRtpCapabilities: device.rtpCapabilities },
-        (res: any) => { if (res?.error) console.error("[getProducers] error:", res.error); });
+      socket.emit('getProducers', { roomId, clientRtpCapabilities: device.rtpCapabilities },
+        (res: any) => { if (res?.error) console.error('[getProducers] error:', res.error); });
     } catch (error) {
-      console.error("[start] fatal error:", error);
-      setTimeout(() => leaveMeeting(), 0);
+      console.error('[start] fatal error:', error);
+      leaveMeeting();
     }
-  }, [roomId, tempUser, upsertTrack]);
+  }, [roomId, tempUser, upsertTrack, leaveMeeting]);
 
-  // Keep a stable ref to the latest `start` so the bootstrap effect can call
-  // it without listing it as a dependency (which would cause re-fires).
   const startRef = useRef(start);
-  useEffect(() => {console.log("starting", startRef.current, socketRef.current); startRef.current = start; }, [start]);
+  useEffect(() => { startRef.current = start; }, [start]);
 
-  // ── Socket bootstrap ───────────────────────────────────────────────────────
-  // Dependencies: only [roomId, tempUser] — both are stable primitive/object
-  // identity values that change only when the user navigates or signs in.
-  // `start` is intentionally NOT a dependency; we call it via startRef instead.
   useEffect(() => {
     if (!roomId || !tempUser) return;
-
-    // Synchronous guard — prevents any second invocation from proceeding,
-    // whether it arrives synchronously (guest, no await) or after an async
-    // gap (authenticated user awaiting getIdToken).
     if (didInitRef.current) return;
     didInitRef.current = true;
 
@@ -460,14 +459,12 @@ const App: React.FC = () => {
     (async () => {
       try {
         const token = auth.currentUser
-          ? await auth.currentUser.getIdToken(true).catch(() => "")
-          : "";
-  
-        // If cleanup ran while we were awaiting the token, bail out.
+          ? await auth.currentUser.getIdToken(true).catch(() => '')
+          : '';
+
         if (cancelled) return;
-  
-        console.log('starting socket')
-        const socket = io("http://localhost:3000", {
+
+        const socket = io(SERVER_URL, {
           reconnection: true,
           reconnectionAttempts: 5,
           auth: { token },
@@ -475,31 +472,38 @@ const App: React.FC = () => {
         } as any);
         socketRef.current = socket;
         deviceRef.current = new mediasoupClient.Device();
-  
-        socket.on("connect", () => {
-          console.log("[socket] connected id=", socket.id);
+
+        socket.on('connect', () => {
+          console.log('[socket] connected id=', socket.id);
           socket.emit(
-            "joinRoom",
+            'joinRoom',
             { roomId, rtpCapabilities: null, appUserId: tempUser.id, appUserName: tempUser.name },
-            async (res: { rtpCapabilities: any; peers: any, error: any }) => {
+            async (res: { rtpCapabilities: any; peers: any; error: any }) => {
               try {
+                if (res.error) {
+                  setConnectError(res.error);
+                  setTimeout(() => leaveMeeting(), 2500);
+                  return;
+                }
                 setPPs(res.peers ?? []);
                 await deviceRef.current!.load({ routerRtpCapabilities: res.rtpCapabilities });
                 await startRef.current();
-              } catch (e:any) {
-                console.error("[device/start] error:", e, res.error);
-                alert(res.error)
-                navigate('/dashboard')
+              } catch (e: any) {
+                console.error('[device/start] error:', e);
+                setConnectError(e.message || 'Connection failed');
+                setTimeout(() => leaveMeeting(), 2500);
               }
             }
           );
         });
-  
-        socket.on("connect_error", (e: Error) =>
-          console.error("[socket] connect_error:", e.message)
-        );
+
+        socket.on('connect_error', (e: Error) => {
+          console.error('[socket] connect_error:', e.message);
+          setConnectError('Failed to connect to server. Returning to home…');
+          setTimeout(() => leaveMeeting(), 2500);
+        });
       } catch (error) {
-        console.error("connecterr", error)
+        console.error('[socket bootstrap]', error);
       }
     })();
 
@@ -512,9 +516,8 @@ const App: React.FC = () => {
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
     };
-  }, [roomId, tempUser]); // <-- `start` deliberately excluded; called via startRef
+  }, [roomId, tempUser]);
 
-  // ── Screen share detection ─────────────────────────────────────────────────
   const screenShareParticipant = useMemo(() => {
     return pps?.find((p) => {
       const stream = streams[p.id];
@@ -525,43 +528,36 @@ const App: React.FC = () => {
     });
   }, [pps, streams]);
 
-  // ── Render ─────────────────────────────────────────────────────────────────
-  if (loading) {
-    return (
-      <Box sx={{ display: "flex", justifyContent: "center", alignItems: "center", height: "100vh", flexDirection: "column", gap: 2, bgcolor: "#0a0a0f" }}>
-        <CircularProgress sx={{ color: "#6ee7b7" }} />
-        <Typography sx={{ color: "#94a3b8" }}>Joining meeting…</Typography>
-      </Box>
-    );
-  }
-
   return (
-    <Box sx={{ display: "flex", height: "100vh", width: "100%", overflow: "hidden", bgcolor: "#0a0a0f", flexDirection: "column" }}>
-      <AppBar position="static" elevation={0}
-        sx={{ bgcolor: "rgba(15,15,25,0.95)", backdropFilter: "blur(12px)", borderBottom: "1px solid rgba(255,255,255,0.06)", flexShrink: 0 }}>
+    <Box sx={{ display: 'flex', height: '100vh', width: '100%', overflow: 'hidden', bgcolor: '#0a0a0f', flexDirection: 'column' }}>
+      <AppBar
+        position="static"
+        elevation={0}
+        sx={{ bgcolor: 'rgba(15,15,25,0.95)', backdropFilter: 'blur(12px)', borderBottom: '1px solid rgba(255,255,255,0.06)', flexShrink: 0 }}
+      >
         <Toolbar sx={{ gap: 1 }}>
-          <IconButton edge="start" onClick={() => navigate("/dashboard")}
-            sx={{ color: "#94a3b8", "&:hover": { color: "#fff" } }}>
+          <IconButton edge="start" onClick={() => leaveMeeting()} sx={{ color: '#94a3b8', '&:hover': { color: '#fff' } }}>
             <ArrowLeft size={20} />
           </IconButton>
-          <Typography variant="h6"
-            sx={{ flexGrow: 1, fontFamily: "'Sora', sans-serif", fontWeight: 600, fontSize: "1rem", color: "#e2e8f0", letterSpacing: "-0.01em" }}>
-            {title || "Meeting"}
+          <Typography
+            variant="h6"
+            sx={{ flexGrow: 1, fontFamily: "'Sora', sans-serif", fontWeight: 600, fontSize: '1rem', color: '#e2e8f0', letterSpacing: '-0.01em' }}
+          >
+            {title || 'Meeting'}
           </Typography>
-          <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, bgcolor: "rgba(255,255,255,0.05)", borderRadius: 2, px: 1.5, py: 0.5 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, bgcolor: 'rgba(255,255,255,0.05)', borderRadius: 2, px: 1.5, py: 0.5 }}>
             <Clock size={14} color="#6ee7b7" />
-            <Typography variant="body2"
-              sx={{ color: "#6ee7b7", fontFamily: "monospace", fontSize: "0.8rem", letterSpacing: "0.05em" }}>
+            <Typography variant="body2" sx={{ color: '#6ee7b7', fontFamily: 'monospace', fontSize: '0.8rem', letterSpacing: '0.05em' }}>
               {formatElapsedTime()}
             </Typography>
           </Box>
         </Toolbar>
       </AppBar>
 
-      <Box sx={{ flex: 1, overflow: "hidden", position: "relative" }}>
+      <Box sx={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
         <VideoGrid
           participants={pps}
-          layout={screenShareParticipant ? "presentation" : "grid"}
+          layout={screenShareParticipant ? 'presentation' : 'grid'}
           screenShareParticipantId={screenShareParticipant?.id}
           streams={streams}
         />
@@ -569,12 +565,18 @@ const App: React.FC = () => {
 
       <MeetingControls
         onLeave={() => leaveMeeting()}
-        onToggleChat={() => {}}
+        onToggleChat={() => setChatOpen(!isChatOpen)}
         onToggleParticipants={() => {}}
         unreadMessages={unreadMessages}
       />
+
+      <Snackbar open={!!connectError} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
+        <Alert severity="error" sx={{ width: '100%' }}>
+          {connectError}
+        </Alert>
+      </Snackbar>
     </Box>
   );
 };
 
-export default App;
+export default MeetingRoom;
