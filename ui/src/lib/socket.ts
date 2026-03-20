@@ -4,7 +4,7 @@ let socket: Socket | null = null;
 
 export function getSocket(): Socket {
   if (!socket) {
-    socket = io(import.meta.env.VITE_SOCKET_URL || 'http://localhost:3001', {
+    socket = io(import.meta.env.VITE_SOCKET_URL || 'https://66ce-143-105-174-4.ngrok-free.app', {
       transports: ['websocket', 'polling'],
       autoConnect: false,
       
